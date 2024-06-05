@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:js_interop';
+import 'dart:math';
 import 'package:web/web.dart';
 import 'dart:typed_data';
 
@@ -56,8 +57,7 @@ class FilePickerWeb extends FilePicker {
           'You are setting a type [$type]. Custom extension filters are only allowed with FileType.custom, please change it or remove filters.');
     }
 
-    final Completer<List<PlatformFile>?> filesCompleter =
-        Completer<List<PlatformFile>?>();
+    final Completer<List<PlatformFile>?> filesCompleter = Completer<List<PlatformFile>?>();
 
     String accept = _fileType(type, allowedExtensions);
     HTMLInputElement uploadInput = HTMLInputElement();
@@ -192,40 +192,133 @@ class FilePickerWeb extends FilePicker {
         return 'video/*|image/*';
 
       case FileType.custom:
-        return allowedExtensions!
-            .fold('', (prev, next) => '${prev.isEmpty ? '' : '$prev,'} .$next');
+        return allowedExtensions!.fold('', (prev, next) => '${prev.isEmpty ? '' : '$prev,'} .$next');
     }
   }
 
-  Stream<List<int>> _openFileReadStream(File file) async* {
-    final reader = FileReader();
+  Stream<List<int>> _openFileReadStream(File file) {
+    return BlobStream(file);
+    
+  //   final reader = FileReader();
 
-    int start = 0;
-    while (start < file.size) {
-      final end = start + _readStreamChunkSize > file.size
-          ? file.size
-          : start + _readStreamChunkSize;
-      final blob = file.slice(start, end);
-      reader.readAsArrayBuffer(blob);
-      await EventStreamProviders.loadEvent.forTarget(reader).first;
-      final JSAny? readerResult = reader.result;
-      if (readerResult == null) {
-        continue;
-      }
-      // TODO: use `isA<JSArrayBuffer>()` when switching to Dart 3.4
-      // Handle the ArrayBuffer type. This maps to a `ByteBuffer` in Dart.
-      if (readerResult.instanceOfString('ArrayBuffer')) {
-        yield (readerResult as JSArrayBuffer).toDart.asUint8List();
-        start += _readStreamChunkSize;
-        continue;
-      }
-      // TODO: use `isA<JSArray>()` when switching to Dart 3.4
-      // Handle the Array type.
-      if (readerResult.instanceOfString('Array')) {
-        // Assume this is a List<int>.
-        yield (readerResult as JSArray).toDart.cast<int>();
-        start += _readStreamChunkSize;
-      }
-    }
+  //   int start = 0;
+  //   while (start < file.size) {
+  //     final end = start + _readStreamChunkSize > file.size ? file.size : start + _readStreamChunkSize;
+  //     final blob = file.slice(start, end);
+  //     reader.readAsArrayBuffer(blob);
+  //     await EventStreamProviders.loadEvent.forTarget(reader).first;
+  //     final JSAny? readerResult = reader.result;
+  //     if (readerResult == null) {
+  //       continue;
+  //     }
+  //     // TODO: use `isA<JSArrayBuffer>()` when switching to Dart 3.4
+  //     // Handle the ArrayBuffer type. This maps to a `ByteBuffer` in Dart.
+  //     if (readerResult.instanceOfString('ArrayBuffer')) {
+  //       yield (readerResult as JSArrayBuffer).toDart.asUint8List();
+  //       start += _readStreamChunkSize;
+  //       continue;
+  //     }
+  //     // TODO: use `isA<JSArray>()` when switching to Dart 3.4
+  //     // Handle the Array type.
+  //     if (readerResult.instanceOfString('Array')) {
+  //       // Assume this is a List<int>.
+  //       yield (readerResult as JSArray).toDart.cast<int>();
+  //       start += _readStreamChunkSize;
+  //     }
+  //   }
   }
+}
+
+// Hot-mess adapted from from https://github.com/flutter/packages/pull/5158/commits/676e98263713915c5fc8111202ddef41fe9eaf45
+// How is this not solved in 2024
+
+const int MAX_CHUNK_SIZE = 25 * 1024 * 1024;
+
+/// This class streams an [Blob] in chunks of [MAX_CHUNK_SIZE] bytes.
+class BlobStream extends Stream<Uint8List> {
+  /// Constructs the byte stream.
+  ///
+  /// If passed, [start] will be used as the first byte to read, and [end]
+  /// will be the last. If not set, the [blob] will be read in its entirety.
+  BlobStream(blob, [int? start, int? end])
+      : _blob = blob,
+        _nextByte = start ?? 0,
+        _finalByte = end;
+
+  // The source of data that we want to Stream
+  final Blob _blob;
+
+  // The byte that will be read next.
+  int _nextByte;
+  // The last byte that will be read (if passed).
+  final int? _finalByte;
+
+  // The StreamController that underpins this class.
+  late StreamController<Uint8List> _controller;
+
+  @override
+  StreamSubscription<Uint8List> listen(void Function(Uint8List event)? onData,
+      {Function? onError, void Function()? onDone, bool? cancelOnError}) {
+    _controller = StreamController<Uint8List>(
+      onListen: _readChunk,
+    );
+    return _controller.stream.listen(onData, onError: onError, onDone: onDone, cancelOnError: cancelOnError);
+  }
+
+  // Reads [_blockSize] bytes from [_currentPosition] from [_blob].
+  Future<void> _readChunk() async {
+    final int chunkSize = _getNextChunkSize(_nextByte, end: _finalByte);
+    assert(chunkSize >= 0);
+
+    return Future.value(_blob)
+        .then((Blob blob) => blob.slice(_nextByte, _nextByte + chunkSize))
+        .then(blobToByteBuffer)
+        .then(_broadcastBytes)
+        .then((int bytes) {
+      // Computes if the blob has been fully read.
+      // Move the internal [_nextByte] pointer by [bytes].
+      _nextByte += bytes;
+      // The blob is fully read when _nextByte is _finalByte, or
+      // when readBytes is smaller than CHUNK_SIZE.
+      return (bytes < MAX_CHUNK_SIZE) || (_nextByte == _finalByte);
+    }).then((bool done) => !done ? _readChunk() : _doneReading());
+  }
+
+  // Sends the bytes through the stream, and returns how many bytes were sent.
+  int _broadcastBytes(Uint8List bytes) {
+    _controller.add(bytes);
+    return bytes.lengthInBytes;
+  }
+
+  // Cleanup when the stream is done.
+  Future<void> _doneReading() {
+    return _controller.close();
+  }
+
+  // Returns the size in bytes of the next chunk.
+  //
+  // When [end] is not passed, this always returns [max] (which defaults to
+  // [CHUNK_SIZE]).
+  //
+  // When `end` **is** passed, this returns either the remaining
+  // bytes to read (`end - start`), or `max`, whatever is **smaller**.
+  int _getNextChunkSize(int start, {int max = MAX_CHUNK_SIZE, int? end}) {
+    return (end == null) ? max : min(max, end - start);
+  }
+}
+
+/// Converts an html [Blob] object to a [Uint8List], through a [FileReader].
+Future<Uint8List> blobToByteBuffer(Blob blob) async {
+  final FileReader reader = FileReader();
+  reader.readAsArrayBuffer(blob);
+
+  await reader.onLoadEnd.first;
+
+  final Uint8List? result = reader.result as Uint8List?;
+
+  if (result == null) {
+    throw Exception('Cannot read bytes from Blob. Is it still available?');
+  }
+
+  return result;
 }
