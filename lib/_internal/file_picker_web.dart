@@ -314,7 +314,7 @@ Future<Uint8List> blobToByteBuffer(Blob blob) async {
 
   await reader.onLoadEnd.first;
 
-  final Uint8List? result = reader.result as Uint8List?;
+  final Uint8List? result = (reader.result as JSArrayBuffer).toDart.asUint8List();
 
   if (result == null) {
     throw Exception('Cannot read bytes from Blob. Is it still available?');
